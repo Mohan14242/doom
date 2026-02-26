@@ -1,0 +1,146 @@
+pipeline {
+    agent any
+
+    parameters {
+        booleanParam(
+            name: 'ROLLBACK',
+            defaultValue: false,
+            description: 'Enable rollback'
+        )
+        string(
+            name: 'ROLLBACK_VERSION',
+            defaultValue: '',
+            description: 'Version to rollback to'
+        )
+    }
+
+    stages {
+        stage('Load Project Configuration') {
+            steps {
+                script {
+                    if (!fileExists('config.json')) {
+                        error "config.json file not found!"
+                    }
+
+                    def projectConfig = readJSON file: 'config.json'
+                    echo "Loaded Config: ${projectConfig}"
+
+                    env.SERVICE_NAME = projectConfig.serviceName ?: error("serviceName missing in config.json")
+                    env.GITHUB_REPO  = projectConfig.repoUrl ?: "not-defined"
+
+                    echo "SERVICE_NAME = ${env.SERVICE_NAME}"
+                }
+            }
+        }
+
+        stage('Detect Environment') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == 'dev') {
+                        env.ENVIRONMENT = 'dev'
+                    } else if (env.BRANCH_NAME == 'test') {
+                        env.ENVIRONMENT = 'test'
+                    } else if (env.BRANCH_NAME in ['main', 'master']) {
+                        env.ENVIRONMENT = 'prod'
+                    } else {
+                        error "Unsupported branch: ${env.BRANCH_NAME}"
+                    }
+
+                    echo "ENVIRONMENT = ${env.ENVIRONMENT}"
+                }
+            }
+        }
+
+        /* ================= NORMAL DEPLOY ================= */
+
+        stage("Generate Version") {
+            when {
+                expression { !params.ROLLBACK }
+            }
+            steps {
+                script {
+                    env.COMMIT_SHA = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+
+                    def randomNum = new Random().nextInt(9000) + 1000
+                    env.VERSION = "${env.SERVICE_NAME}-${env.COMMIT_SHA}-${randomNum}"
+                }
+            }
+        }
+
+        stage("Simulate Deploy") {
+            when {
+                expression { !params.ROLLBACK }
+            }
+            steps {
+                echo "🚀 Simulating deployment of ${env.VERSION} to ${env.ENVIRONMENT}"
+            }
+        }
+
+        /* ================= ROLLBACK ================= */
+
+        stage("Rollback") {
+            when {
+                allOf {
+                    expression { params.ROLLBACK }
+                    expression { params.ROLLBACK_VERSION?.trim() }
+                }
+            }
+            steps {
+                script {
+                    env.VERSION = params.ROLLBACK_VERSION
+                    echo "🔄 Simulating rollback to version ${env.VERSION} in ${env.ENVIRONMENT}"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                def actionType = params.ROLLBACK ? "rollback" : "deploy"
+
+                echo "✅ Pipeline SUCCESS for ${env.VERSION} (${actionType})"
+
+                sh """
+                  curl -X POST http://52.23.182.188/api/artifacts \
+                    -H "Content-Type: application/json" \
+                    -d '{
+                      "serviceName": "${env.SERVICE_NAME}",
+                      "environment": "${env.ENVIRONMENT}",
+                      "version": "myrepo/${env.SERVICE_NAME}:${env.VERSION}",
+                      "artifactType": "docker",
+                      "commitSha": "${env.COMMIT_SHA ?: ""}",
+                      "pipeline": "jenkins",
+                      "action": "${actionType}",
+                      "status": "success"
+                    }'
+                """
+            }
+        }
+        failure {
+            script {
+            def actionType = params.ROLLBACK ? "rollback" : "deploy"
+
+            echo "❌ Pipeline FAILED for ${env.SERVICE_NAME} (${actionType})"
+
+            sh """
+              curl -X POST http://52.23.182.188/api/artifacts \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "serviceName": "${env.SERVICE_NAME}",
+                  "environment": "${env.ENVIRONMENT}",
+                  "version": "myrepo/${env.SERVICE_NAME}:${env.VERSION}",
+                  "artifactType": "docker",
+                  "commitSha": "${env.COMMIT_SHA ?: ""}",
+                  "pipeline": "jenkins",
+                  "action": "${actionType}",
+                  "status": "failed"
+                }'
+            """
+            }
+        }
+    }
+}
